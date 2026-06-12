@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Stylized Bluetooth rune over a chip outline -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="4"
+        android:pathData="M34,34 L74,34 L74,74 L34,74 Z" />
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="4"
+        android:strokeLineCap="round"
+        android:pathData="M42,26 L42,34 M54,26 L54,34 M66,26 L66,34 M42,74 L42,82 M54,74 L54,82 M66,74 L66,82 M26,42 L34,42 M26,54 L34,54 M26,66 L34,66 M74,42 L82,42 M74,54 L82,54 M74,66 L82,66" />
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="4"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M46,46 L62,62 L54,68 L54,40 L62,46 L46,62" />
+</vector>
