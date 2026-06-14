@@ -9,6 +9,7 @@ import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
+import android.bluetooth.BluetoothStatusCodes
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
@@ -16,12 +17,18 @@ import android.content.Context
 import android.os.Build
 import java.util.UUID
 import java.util.concurrent.ConcurrentLinkedQueue
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
 
 /**
  * BLE client for the Nordic UART Service (NUS) exposed by the Pico W firmware.
@@ -89,9 +96,18 @@ class BleManager(private val context: Context) {
     private var mtuPayload = 20
     private val rxBuffer = StringBuilder()
 
-    /** Outgoing chunks, drained one write at a time. */
+    private val scope = CoroutineScope(Dispatchers.Main.immediate + SupervisorJob())
+
+    /**
+     * Outgoing chunks, drained one write at a time. We use write-WITH-response
+     * (the firmware acknowledges every write) because no-response writes don't
+     * deliver a reliable [BluetoothGattCallback.onCharacteristicWrite] on all
+     * controllers — without that callback the queue jams on the first chunk.
+     */
     private val writeQueue = ConcurrentLinkedQueue<ByteArray>()
     @Volatile private var writeInFlight = false
+    private var writeWatchdog: Job? = null
+    private val writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
 
     val isBluetoothEnabled: Boolean get() = adapter?.isEnabled == true
 
@@ -211,6 +227,10 @@ class BleManager(private val context: Context) {
             characteristic: BluetoothGattCharacteristic,
             status: Int,
         ) {
+            writeWatchdog?.cancel()
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                _transportLog.tryEmit("Write failed (status $status)")
+            }
             writeInFlight = false
             drainWriteQueue()
         }
@@ -251,6 +271,7 @@ class BleManager(private val context: Context) {
     }
 
     private fun cleanup() {
+        writeWatchdog?.cancel()
         gatt = null
         rxCharacteristic = null
         rxBuffer.setLength(0)
@@ -296,17 +317,48 @@ class BleManager(private val context: Context) {
         if (writeInFlight) return
         val g = gatt ?: return
         val rx = rxCharacteristic ?: return
-        val chunk = writeQueue.poll() ?: return
+        // Peek, not poll: keep the chunk in the queue until the stack actually
+        // accepts it, so a "busy" rejection can be retried without data loss.
+        val chunk = writeQueue.peek() ?: return
         writeInFlight = true
-        if (Build.VERSION.SDK_INT >= 33) {
-            g.writeCharacteristic(rx, chunk, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
+        val accepted = if (Build.VERSION.SDK_INT >= 33) {
+            g.writeCharacteristic(rx, chunk, writeType) == BluetoothStatusCodes.SUCCESS
         } else {
             @Suppress("DEPRECATION")
-            rx.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+            rx.writeType = writeType
             @Suppress("DEPRECATION")
             rx.value = chunk
             @Suppress("DEPRECATION")
             g.writeCharacteristic(rx)
+        }
+        if (accepted) {
+            writeQueue.poll()
+            armWriteWatchdog()
+        } else {
+            // GATT layer is momentarily busy (common right after the CCCD write
+            // that precedes the first command). Release the gate and retry.
+            writeInFlight = false
+            scope.launch {
+                delay(25)
+                drainWriteQueue()
+            }
+        }
+    }
+
+    /**
+     * Safety net: if the stack ever fails to deliver [onCharacteristicWrite] for
+     * an accepted write, the queue would stall forever. After a timeout we drop
+     * the gate and keep draining so a single dropped callback can't jam the link.
+     */
+    private fun armWriteWatchdog() {
+        writeWatchdog?.cancel()
+        writeWatchdog = scope.launch {
+            delay(2500)
+            if (writeInFlight) {
+                _transportLog.tryEmit("Write acknowledgement timed out — continuing")
+                writeInFlight = false
+                drainWriteQueue()
+            }
         }
     }
 }
