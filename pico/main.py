@@ -36,6 +36,11 @@ from machine import ADC, PWM, Pin, RTC
 FIRMWARE_VERSION = "PicoLink 1.0.0"
 DEVICE_NAME = "PicoLink"
 
+# When True, every received command and outgoing reply is echoed to the USB
+# serial console (Thonny / mpremote). Invaluable for confirming whether the
+# phone's writes are actually reaching the board. Set False for production.
+DEBUG = True
+
 _UART_SERVICE = bluetooth.UUID("6E400001-B5A3-F393-E0A9-E50E24DCCA9E")
 _UART_RX = bluetooth.UUID("6E400002-B5A3-F393-E0A9-E50E24DCCA9E")  # phone -> pico
 _UART_TX = bluetooth.UUID("6E400003-B5A3-F393-E0A9-E50E24DCCA9E")  # pico -> phone
@@ -546,26 +551,46 @@ async def deferred_reset():
 async def rx_loop(rx):
     buffer = b""
     while True:
-        _, data = await rx.written()
-        buffer += data
-        while b"\n" in buffer:
-            line, buffer = buffer.split(b"\n", 1)
-            line = line.strip()
-            if not line:
+        try:
+            # aioble returns (connection, data) when the characteristic is
+            # created with capture=True, but some versions return only the
+            # connection. Handle both so the receive loop never dies on an
+            # unexpected shape (which would silently stop all command handling).
+            result = await rx.written()
+            if isinstance(result, tuple):
+                data = result[1]
+            else:
+                data = rx.read()
+            if not data:
                 continue
-            try:
-                msg = json.loads(line)
-            except ValueError:
-                await send_obj(reply_err(-1, "invalid JSON"))
-                continue
-            try:
-                response = await handle_command(msg)
-            except Exception as e:
-                response = reply_err(msg.get("id", -1), "internal: %s" % e)
-            if response is not None:
-                await send_obj(response)
-        if len(buffer) > 4096:
-            buffer = b""  # discard runaway partial frames
+            if DEBUG:
+                print("rx <-", data)
+            buffer += data
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    await send_obj(reply_err(-1, "invalid JSON"))
+                    continue
+                try:
+                    response = await handle_command(msg)
+                except Exception as e:
+                    response = reply_err(msg.get("id", -1), "internal: %s" % e)
+                if response is not None:
+                    if DEBUG:
+                        print("tx ->", response)
+                    await send_obj(response)
+            if len(buffer) > 4096:
+                buffer = b""  # discard runaway partial frames
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print("rx_loop error:", e)
+            buffer = b""
 
 
 async def ble_loop():

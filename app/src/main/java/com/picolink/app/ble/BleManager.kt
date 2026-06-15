@@ -91,23 +91,25 @@ class BleManager(private val context: Context) {
     private val _transportLog = MutableSharedFlow<String>(extraBufferCapacity = 256)
     val transportLog: SharedFlow<String> = _transportLog.asSharedFlow()
 
-    private var gatt: BluetoothGatt? = null
-    private var rxCharacteristic: BluetoothGattCharacteristic? = null
+    @Volatile private var gatt: BluetoothGatt? = null
+    @Volatile private var rxCharacteristic: BluetoothGattCharacteristic? = null
     private var mtuPayload = 20
     private val rxBuffer = StringBuilder()
 
     private val scope = CoroutineScope(Dispatchers.Main.immediate + SupervisorJob())
 
     /**
-     * Outgoing chunks, drained one write at a time. We use write-WITH-response
-     * (the firmware acknowledges every write) because no-response writes don't
-     * deliver a reliable [BluetoothGattCallback.onCharacteristicWrite] on all
-     * controllers — without that callback the queue jams on the first chunk.
+     * Outgoing chunks, drained one write at a time. The write type is chosen
+     * from the characteristic's advertised properties in [onServicesDiscovered]:
+     * write-with-response when the peripheral supports it (gives a reliable
+     * [BluetoothGattCallback.onCharacteristicWrite]), otherwise write-without-
+     * response. A watchdog drops the in-flight gate if no callback arrives, so a
+     * dropped callback can't jam the queue.
      */
     private val writeQueue = ConcurrentLinkedQueue<ByteArray>()
     @Volatile private var writeInFlight = false
     private var writeWatchdog: Job? = null
-    private val writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+    @Volatile private var writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
 
     val isBluetoothEnabled: Boolean get() = adapter?.isEnabled == true
 
@@ -185,6 +187,23 @@ class BleManager(private val context: Context) {
                 return
             }
             rxCharacteristic = rx
+            // Match the write type to what the RX characteristic actually
+            // advertises. Prefer write-with-response (deterministic ack); fall
+            // back to write-without-response if that's all the peripheral offers.
+            val props = rx.properties
+            val hasWrite = props and BluetoothGattCharacteristic.PROPERTY_WRITE != 0
+            val hasWriteNoResp =
+                props and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0
+            writeType = when {
+                hasWrite -> BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                hasWriteNoResp -> BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                else -> BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+            }
+            _transportLog.tryEmit(
+                "RX characteristic write type: " +
+                    if (writeType == BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
+                        "with-response" else "no-response"
+            )
             g.setCharacteristicNotification(tx, true)
             val cccd = tx.getDescriptor(CCCD)
             if (cccd != null) {
